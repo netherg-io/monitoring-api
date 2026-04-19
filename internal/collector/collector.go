@@ -58,15 +58,16 @@ type DiskInfo struct {
 }
 
 type Snapshot struct {
-	TS         time.Time         `json:"ts"`
-	Host       HostInfo          `json:"host"`
-	CPU        float64           `json:"cpu"`
-	Mem        buffer.Point      `json:"mem_point"`
-	Load       [3]float64        `json:"load"`
-	NetRxBps   uint64            `json:"net_rx_bps"`
-	NetTxBps   uint64            `json:"net_tx_bps"`
-	Disks      []DiskInfo        `json:"disks"`
-	Containers []ContainerRow    `json:"containers"`
+	TS         time.Time      `json:"ts"`
+	Host       HostInfo       `json:"host"`
+	CPU        float64        `json:"cpu"`
+	CPUPerCore []float64      `json:"cpu_per_core"`
+	Mem        buffer.Point   `json:"mem_point"`
+	Load       [3]float64     `json:"load"`
+	NetRxBps   uint64         `json:"net_rx_bps"`
+	NetTxBps   uint64         `json:"net_tx_bps"`
+	Disks      []DiskInfo     `json:"disks"`
+	Containers []ContainerRow `json:"containers"`
 }
 
 type ContainerRow struct {
@@ -119,6 +120,7 @@ func (c *Collector) store(s Snapshot) {
 	c.b.Push(buffer.Point{
 		TS:         s.TS,
 		CPUPercent: s.CPU,
+		CPUPerCore: append([]float64(nil), s.CPUPerCore...),
 		MemPercent: s.Mem.MemPercent,
 		MemUsed:    s.Mem.MemUsed,
 		MemTotal:   s.Mem.MemTotal,
@@ -153,8 +155,13 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 		snap.Host.CPUCores = n
 	}
 
-	if pcts, err := cpu.PercentWithContext(ctx, 0, false); err == nil && len(pcts) > 0 {
-		snap.CPU = pcts[0]
+	if pcts, err := cpu.PercentWithContext(ctx, 0, true); err == nil && len(pcts) > 0 {
+		snap.CPUPerCore = pcts
+		var sum float64
+		for _, p := range pcts {
+			sum += p
+		}
+		snap.CPU = sum / float64(len(pcts))
 	}
 
 	if vm, err := mem.VirtualMemoryWithContext(ctx); err == nil {

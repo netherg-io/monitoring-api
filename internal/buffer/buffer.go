@@ -8,6 +8,7 @@ import (
 type Point struct {
 	TS         time.Time `json:"ts"`
 	CPUPercent float64   `json:"cpu"`
+	CPUPerCore []float64 `json:"cpu_per_core"`
 	MemPercent float64   `json:"mem"`
 	MemUsed    uint64    `json:"mem_used"`
 	MemTotal   uint64    `json:"mem_total"`
