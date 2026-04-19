@@ -12,12 +12,46 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const apiVersion = "v1.43"
+
+var (
+	reStateUp     = regexp.MustCompile(`(?i)^up\s+(?:about\s+)?(?:(\d+)|an?)\s+(second|minute|hour|day|week|month|year)s?`)
+	reStateExited = regexp.MustCompile(`(?i)exited.*?(?:(\d+)|an?)\s+(second|minute|hour|day|week|month|year)s?\s+ago`)
+)
+
+var stateDurUnits = map[string]int64{
+	"second": 1,
+	"minute": 60,
+	"hour":   3600,
+	"day":    86400,
+	"week":   604800,
+	"month":  2592000,
+	"year":   31536000,
+}
+
+func parseStateTS(status string, now time.Time) int64 {
+	lower := strings.ToLower(status)
+	extract := func(m []string) int64 {
+		qty := int64(1)
+		if m[1] != "" {
+			fmt.Sscanf(m[1], "%d", &qty)
+		}
+		return now.Unix() - qty*stateDurUnits[m[2]]
+	}
+	if m := reStateUp.FindStringSubmatch(lower); m != nil {
+		return extract(m)
+	}
+	if m := reStateExited.FindStringSubmatch(lower); m != nil {
+		return extract(m)
+	}
+	return 0
+}
 
 type Client struct {
 	hc      *http.Client
@@ -88,6 +122,7 @@ type Info struct {
 	State   string   `json:"state"`
 	Status  string   `json:"status"`
 	Created int64    `json:"created"`
+	StateTS int64    `json:"state_ts"`
 	Ports   []string `json:"ports,omitempty"`
 }
 
@@ -133,6 +168,7 @@ func (d *Client) List(ctx context.Context) ([]Info, error) {
 			ID: r.ID, Name: name, Image: r.Image,
 			State: r.State, Status: r.Status,
 			Created: r.Created, Ports: ports,
+			StateTS: parseStateTS(r.Status, time.Now()),
 		})
 	}
 	return out, nil
@@ -147,6 +183,8 @@ type Stat struct {
 	MemPercent float64 `json:"mem"`
 	NetRx      uint64  `json:"net_rx"`
 	NetTx      uint64  `json:"net_tx"`
+	NetRxBps   uint64  `json:"net_rx_bps"`
+	NetTxBps   uint64  `json:"net_tx_bps"`
 	BlockRead  uint64  `json:"blk_read"`
 	BlockWrite uint64  `json:"blk_write"`
 }
@@ -172,7 +210,10 @@ type rawStats struct {
 		Limit uint64            `json:"limit"`
 		Stats map[string]uint64 `json:"stats"`
 	} `json:"memory_stats"`
-	Networks   map[string]struct{ RxBytes, TxBytes uint64 } `json:"networks"`
+	Networks map[string]struct {
+		RxBytes uint64 `json:"rx_bytes"`
+		TxBytes uint64 `json:"tx_bytes"`
+	} `json:"networks"`
 	BlkioStats struct {
 		IoServiceBytesRecursive []struct {
 			Op    string `json:"op"`
@@ -198,11 +239,7 @@ func (d *Client) Stats(ctx context.Context, id string) (Stat, error) {
 	cpuDelta := float64(r.CPUStats.CPUUsage.TotalUsage) - float64(r.PreCPUStats.CPUUsage.TotalUsage)
 	sysDelta := float64(r.CPUStats.SystemCPUUsage) - float64(r.PreCPUStats.SystemCPUUsage)
 	if sysDelta > 0 && cpuDelta > 0 {
-		cpus := float64(r.CPUStats.OnlineCPUs)
-		if cpus == 0 {
-			cpus = 1
-		}
-		cpuPct = (cpuDelta / sysDelta) * cpus * 100.0
+		cpuPct = (cpuDelta / sysDelta) * 100.0
 	}
 
 	memUsed := r.MemoryStats.Usage

@@ -20,16 +20,22 @@ import (
 	"monitoring-api/internal/docker"
 )
 
+type containerNetEntry struct {
+	rx, tx uint64
+	at     time.Time
+}
+
 type Collector struct {
 	d        *docker.Client
 	b        *buffer.Buffer
 	interval time.Duration
 
-	mu            sync.RWMutex
-	lastSnapshot  Snapshot
-	lastNetRx     uint64
-	lastNetTx     uint64
-	lastNetAt     time.Time
+	mu               sync.RWMutex
+	lastSnapshot     Snapshot
+	lastNetRx        uint64
+	lastNetTx        uint64
+	lastNetAt        time.Time
+	lastContainerNet map[string]containerNetEntry
 }
 
 type HostInfo struct {
@@ -44,10 +50,11 @@ type HostInfo struct {
 }
 
 type DiskInfo struct {
-	Path       string  `json:"path"`
-	Total      uint64  `json:"total"`
-	Used       uint64  `json:"used"`
-	UsedPct    float64 `json:"used_pct"`
+	Path    string  `json:"path"`
+	Device  string  `json:"device"`
+	Total   uint64  `json:"total"`
+	Used    uint64  `json:"used"`
+	UsedPct float64 `json:"used_pct"`
 }
 
 type Snapshot struct {
@@ -68,7 +75,12 @@ type ContainerRow struct {
 }
 
 func New(d *docker.Client, b *buffer.Buffer, interval time.Duration) *Collector {
-	return &Collector{d: d, b: b, interval: interval}
+	return &Collector{
+		d:                d,
+		b:                b,
+		interval:         interval,
+		lastContainerNet: make(map[string]containerNetEntry),
+	}
 }
 
 func (c *Collector) Run(ctx context.Context) {
@@ -161,10 +173,22 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 			rootfs = "/host/rootfs"
 		}
 	}
+	var diskFilter []string
+	for _, d := range strings.Split(os.Getenv("MONITOR_DISKS"), ",") {
+		if d = strings.TrimSpace(d); d != "" {
+			diskFilter = append(diskFilter, d)
+		}
+	}
 	if parts, err := disk.PartitionsWithContext(ctx, false); err == nil {
 		seen := map[string]bool{}
+		// When diskFilter is set, pick only the largest partition per physical device,
+		// so a disk with multiple partitions (e.g. sda1=/boot/efi, sda2=/) is shown once.
+		perDevice := map[string]DiskInfo{}
 		for _, p := range parts {
 			if seen[p.Mountpoint] || !isRealFS(p.Fstype) {
+				continue
+			}
+			if len(diskFilter) > 0 && !diskMatchesFilter(p.Device, diskFilter) {
 				continue
 			}
 			seen[p.Mountpoint] = true
@@ -176,9 +200,27 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 			if err != nil {
 				continue
 			}
-			snap.Disks = append(snap.Disks, DiskInfo{
-				Path: p.Mountpoint, Total: u.Total, Used: u.Used, UsedPct: u.UsedPercent,
-			})
+			info := DiskInfo{
+				Path: p.Mountpoint, Device: p.Device, Total: u.Total, Used: u.Used, UsedPct: u.UsedPercent,
+			}
+			if len(diskFilter) > 0 {
+				root := physicalDevice(p.Device)
+				if cur, ok := perDevice[root]; !ok || info.Total > cur.Total {
+					perDevice[root] = info
+				}
+				continue
+			}
+			snap.Disks = append(snap.Disks, info)
+		}
+		if len(diskFilter) > 0 {
+			roots := make([]string, 0, len(perDevice))
+			for r := range perDevice {
+				roots = append(roots, r)
+			}
+			sort.Strings(roots)
+			for _, r := range roots {
+				snap.Disks = append(snap.Disks, perDevice[r])
+			}
 		}
 	}
 
@@ -223,6 +265,29 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 	}
 	wg.Wait()
 
+	newLastNet := make(map[string]containerNetEntry, len(rows))
+	for i := range rows {
+		if rows[i].Stat == nil {
+			continue
+		}
+		rx := rows[i].Stat.NetRx
+		tx := rows[i].Stat.NetTx
+		id := rows[i].ID
+		if prev, ok := c.lastContainerNet[id]; ok {
+			dt := now.Sub(prev.at).Seconds()
+			if dt > 0 {
+				if rx >= prev.rx {
+					rows[i].Stat.NetRxBps = uint64(float64(rx-prev.rx) / dt)
+				}
+				if tx >= prev.tx {
+					rows[i].Stat.NetTxBps = uint64(float64(tx-prev.tx) / dt)
+				}
+			}
+		}
+		newLastNet[id] = containerNetEntry{rx: rx, tx: tx, at: now}
+	}
+	c.lastContainerNet = newLastNet
+
 	sort.Slice(rows, func(i, j int) bool {
 		ci, cj := 0.0, 0.0
 		if rows[i].Stat != nil {
@@ -239,6 +304,30 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 
 	snap.Containers = rows
 	return snap, nil
+}
+
+func diskMatchesFilter(device string, filter []string) bool {
+	for _, f := range filter {
+		if strings.Contains(device, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// physicalDevice strips partition suffix: /dev/sda2 -> /dev/sda, /dev/nvme0n1p1 -> /dev/nvme0n1.
+func physicalDevice(device string) string {
+	s := device
+	for len(s) > 0 && s[len(s)-1] >= '0' && s[len(s)-1] <= '9' {
+		s = s[:len(s)-1]
+	}
+	if strings.HasSuffix(s, "p") && len(s) > 1 {
+		prev := s[len(s)-2]
+		if prev >= '0' && prev <= '9' {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
 }
 
 func isRealFS(t string) bool {
