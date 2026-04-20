@@ -36,6 +36,9 @@ type Collector struct {
 	lastNetTx        uint64
 	lastNetAt        time.Time
 	lastContainerNet map[string]containerNetEntry
+	lastDiskRead     uint64
+	lastDiskWrite    uint64
+	lastDiskAt       time.Time
 }
 
 type HostInfo struct {
@@ -66,6 +69,8 @@ type Snapshot struct {
 	Load       [3]float64     `json:"load"`
 	NetRxBps   uint64         `json:"net_rx_bps"`
 	NetTxBps   uint64         `json:"net_tx_bps"`
+	DiskReadBps  uint64       `json:"disk_read_bps"`
+	DiskWriteBps uint64       `json:"disk_write_bps"`
 	Disks      []DiskInfo     `json:"disks"`
 	Containers []ContainerRow `json:"containers"`
 }
@@ -126,6 +131,8 @@ func (c *Collector) store(s Snapshot) {
 		MemTotal:   s.Mem.MemTotal,
 		NetRx:      s.NetRxBps,
 		NetTx:      s.NetTxBps,
+		DiskReadBps:  s.DiskReadBps,
+		DiskWriteBps: s.DiskWriteBps,
 		Load1:      s.Load[0],
 		Load5:      s.Load[1],
 		Load15:     s.Load[2],
@@ -254,6 +261,32 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 		c.lastNetRx, c.lastNetTx, c.lastNetAt = rx, tx, now
 	}
 
+	if iocs, err := disk.IOCountersWithContext(ctx); err == nil && len(iocs) > 0 {
+		var dr, dw uint64
+		for name, st := range iocs {
+			if !isRealBlockDevice(name) {
+				continue
+			}
+			if len(diskFilter) > 0 && !diskMatchesFilter(name, diskFilter) {
+				continue
+			}
+			dr += st.ReadBytes
+			dw += st.WriteBytes
+		}
+		if !c.lastDiskAt.IsZero() {
+			dt := now.Sub(c.lastDiskAt).Seconds()
+			if dt > 0 {
+				if dr >= c.lastDiskRead {
+					snap.DiskReadBps = uint64(float64(dr-c.lastDiskRead) / dt)
+				}
+				if dw >= c.lastDiskWrite {
+					snap.DiskWriteBps = uint64(float64(dw-c.lastDiskWrite) / dt)
+				}
+			}
+		}
+		c.lastDiskRead, c.lastDiskWrite, c.lastDiskAt = dr, dw, now
+	}
+
 	list, err := c.d.List(ctx)
 	if err != nil {
 		return snap, err
@@ -317,6 +350,45 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 
 	snap.Containers = rows
 	return snap, nil
+}
+
+// isRealBlockDevice excludes partitions and virtual/loop/ram devices so disk
+// I/O totals only reflect physical drives. Matches gopsutil key format (e.g.
+// "sda", "sda1", "nvme0n1", "nvme0n1p1", "dm-0", "loop3", "ram0").
+func isRealBlockDevice(name string) bool {
+	if name == "" {
+		return false
+	}
+	switch {
+	case strings.HasPrefix(name, "loop"),
+		strings.HasPrefix(name, "ram"),
+		strings.HasPrefix(name, "dm-"),
+		strings.HasPrefix(name, "md"),
+		strings.HasPrefix(name, "zram"),
+		strings.HasPrefix(name, "sr"):
+		return false
+	}
+	// Skip partitions: sda1, nvme0n1p1, mmcblk0p1.
+	last := name[len(name)-1]
+	if last >= '0' && last <= '9' {
+		if strings.HasPrefix(name, "sd") || strings.HasPrefix(name, "hd") ||
+			strings.HasPrefix(name, "vd") || strings.HasPrefix(name, "xvd") {
+			return false
+		}
+		if strings.Contains(name, "p") {
+			// nvme0n1 (whole) vs nvme0n1p1 (part). Whole ends in a digit but
+			// has no 'p' followed by digits at the tail.
+			for i := len(name) - 1; i > 0; i-- {
+				if name[i] == 'p' && name[i-1] >= '0' && name[i-1] <= '9' {
+					return false
+				}
+				if name[i] < '0' || name[i] > '9' {
+					break
+				}
+			}
+		}
+	}
+	return true
 }
 
 func diskMatchesFilter(device string, filter []string) bool {
