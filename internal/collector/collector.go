@@ -231,9 +231,15 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 		}
 	}
 
-	if counters, err := net.IOCountersWithContext(ctx, false); err == nil && len(counters) > 0 {
-		rx := counters[0].BytesRecv
-		tx := counters[0].BytesSent
+	rx, tx, netOK := hostNetCounters()
+	if !netOK {
+		if counters, err := net.IOCountersWithContext(ctx, false); err == nil && len(counters) > 0 {
+			rx = counters[0].BytesRecv
+			tx = counters[0].BytesSent
+			netOK = true
+		}
+	}
+	if netOK {
 		if !c.lastNetAt.IsZero() {
 			dt := now.Sub(c.lastNetAt).Seconds()
 			if dt > 0 {

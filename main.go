@@ -13,6 +13,7 @@ import (
 
 	"monitoring-api/internal/api"
 	"monitoring-api/internal/buffer"
+	"monitoring-api/internal/cloudflare"
 	"monitoring-api/internal/collector"
 	"monitoring-api/internal/docker"
 )
@@ -37,15 +38,27 @@ func main() {
 	buf := buffer.New(points)
 	col := collector.New(dc, buf, interval)
 
+	cf := cloudflare.New(
+		os.Getenv("CF_API_TOKEN"),
+		os.Getenv("CF_ACCOUNT_ID"),
+		os.Getenv("CF_TUNNEL_ID"),
+	)
+	cfInterval := parseDuration(envOr("CF_REFRESH_INTERVAL", "60s"))
+
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go col.Run(rootCtx)
+	if cf.Enabled() {
+		go cf.Run(rootCtx, cfInterval)
+		log.Printf("cloudflare tunnel sync enabled (interval=%s)", cfInterval)
+	}
 
 	handler := api.NewRouter(api.Config{
 		Token:            token,
 		Buffer:           buf,
 		Docker:           dc,
 		Collector:        col,
+		Cloudflare:       cf,
 		ControlAllowlist: allow,
 		ControlDenylist:  deny,
 	})
