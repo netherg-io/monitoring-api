@@ -11,7 +11,6 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"monitoring-api/internal/buffer"
-	"monitoring-api/internal/cloudflare"
 	"monitoring-api/internal/collector"
 	"monitoring-api/internal/docker"
 )
@@ -21,7 +20,6 @@ type Config struct {
 	Buffer           *buffer.Buffer
 	Docker           *docker.Client
 	Collector        *collector.Collector
-	Cloudflare       *cloudflare.Client
 	ControlAllowlist []string
 	ControlDenylist  []string
 }
@@ -41,7 +39,6 @@ func NewRouter(cfg Config) http.Handler {
 		r.Get("/snapshot", handleSnapshot(cfg))
 		r.Get("/history", handleHistory(cfg))
 		r.Get("/containers", handleContainers(cfg))
-		r.Get("/tunnels", handleTunnels(cfg))
 		r.Get("/containers/{id}/logs", handleLogs(cfg))
 		r.Post("/containers/{id}/action", handleAction(cfg))
 	})
@@ -87,16 +84,6 @@ func handleContainers(cfg Config) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, 200, list)
-	}
-}
-
-func handleTunnels(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if cfg.Cloudflare == nil || !cfg.Cloudflare.Enabled() {
-			writeJSON(w, 200, map[string][]string{})
-			return
-		}
-		writeJSON(w, 200, cfg.Cloudflare.All())
 	}
 }
 
