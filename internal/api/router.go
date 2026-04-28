@@ -13,6 +13,8 @@ import (
 	"monitoring-api/internal/buffer"
 	"monitoring-api/internal/collector"
 	"monitoring-api/internal/docker"
+	"monitoring-api/internal/storage/rediscache"
+	"monitoring-api/internal/storage/tsdb"
 )
 
 type Config struct {
@@ -20,8 +22,12 @@ type Config struct {
 	Buffer           *buffer.Buffer
 	Docker           *docker.Client
 	Collector        *collector.Collector
+	TSDB             *tsdb.Store
+	Redis            *rediscache.Store
 	ControlAllowlist []string
 	ControlDenylist  []string
+	CORSOrigins      []string
+	Meter            *RequestsMeter
 }
 
 func NewRouter(cfg Config) http.Handler {
@@ -29,8 +35,12 @@ func NewRouter(cfg Config) http.Handler {
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(20 * time.Second))
+	r.Use(corsMiddleware(cfg.CORSOrigins))
 
-	meter := newRequestsMeter(12)
+	meter := cfg.Meter
+	if meter == nil {
+		meter = NewRequestsMeter(cfg.Redis, cfg.TSDB)
+	}
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -77,7 +87,26 @@ func handleHistory(cfg Config) http.HandlerFunc {
 			minutes = 15
 		}
 		since := time.Now().Add(-time.Duration(minutes) * time.Minute)
-		writeJSON(w, 200, cfg.Buffer.Since(since))
+		points := cfg.Buffer.Since(since)
+		// If the requested window exceeds what's in memory, supplement from TSDB.
+		if cfg.TSDB != nil && (len(points) == 0 || points[0].TS.After(since.Add(time.Minute))) {
+			if hist, err := cfg.TSDB.QueryRange(r.Context(), since); err == nil && len(hist) > 0 {
+				if len(points) == 0 {
+					points = hist
+				} else {
+					cutoff := points[0].TS
+					merged := make([]buffer.Point, 0, len(hist)+len(points))
+					for _, p := range hist {
+						if p.TS.Before(cutoff) {
+							merged = append(merged, p)
+						}
+					}
+					merged = append(merged, points...)
+					points = merged
+				}
+			}
+		}
+		writeJSON(w, 200, points)
 	}
 }
 

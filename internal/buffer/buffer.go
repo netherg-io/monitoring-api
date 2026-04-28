@@ -27,19 +27,46 @@ type Buffer struct {
 	size   int
 	head   int
 	count  int
+	onPush func(Point)
 }
 
 func New(size int) *Buffer {
 	return &Buffer{points: make([]Point, size), size: size}
 }
 
-func (b *Buffer) Push(p Point) {
+// SetOnPush registers a callback invoked (asynchronously by the caller's goroutine)
+// after each Push. Used to fan out writes to persistent storage.
+func (b *Buffer) SetOnPush(fn func(Point)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.onPush = fn
+}
+
+// Seed inserts historical points into the buffer (used to warm up after restart).
+// Points are appended in order; if more than size, only the most recent fit.
+func (b *Buffer) Seed(points []Point) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, p := range points {
+		b.points[b.head] = p
+		b.head = (b.head + 1) % b.size
+		if b.count < b.size {
+			b.count++
+		}
+	}
+}
+
+func (b *Buffer) Push(p Point) {
+	b.mu.Lock()
 	b.points[b.head] = p
 	b.head = (b.head + 1) % b.size
 	if b.count < b.size {
 		b.count++
+	}
+	cb := b.onPush
+	b.mu.Unlock()
+	if cb != nil {
+		cb(p)
 	}
 }
 

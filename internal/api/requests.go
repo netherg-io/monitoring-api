@@ -1,95 +1,130 @@
 package api
 
 import (
+	"context"
+	"log"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
+
+	"monitoring-api/internal/storage/rediscache"
+	"monitoring-api/internal/storage/tsdb"
 )
 
-// requestsMeter keeps a per-minute ring buffer of API request counts.
-// Default window is 12h = 720 minute-buckets.
-type requestsMeter struct {
-	mu      sync.Mutex
-	buckets []requestsBucket
-	size    int // number of buckets (e.g. 720 for 12h)
+type RequestsMeter struct {
+	redis *rediscache.Store
+	tsdb  *tsdb.Store
 }
 
 type requestsBucket struct {
-	Minute int64 `json:"ts"`    // unix seconds, truncated to minute
-	Count  int64 `json:"count"` // requests served in that minute
+	Minute int64 `json:"ts"`
+	Count  int64 `json:"count"`
 }
 
-func newRequestsMeter(hours int) *requestsMeter {
+func NewRequestsMeter(rs *rediscache.Store, ts *tsdb.Store) *RequestsMeter {
+	return &RequestsMeter{redis: rs, tsdb: ts}
+}
+
+func (m *RequestsMeter) hit(ctx context.Context, now time.Time) {
+	if m.redis == nil {
+		return
+	}
+	if err := m.redis.IncrRequest(ctx, now); err != nil {
+		log.Printf("requests incr: %v", err)
+	}
+}
+
+// snapshot returns the last `hours` of minute buckets in chronological order.
+// Missing buckets are zero-filled.
+func (m *RequestsMeter) snapshot(ctx context.Context, now time.Time, hours int) []requestsBucket {
 	if hours <= 0 {
 		hours = 12
 	}
-	size := hours * 60
-	return &requestsMeter{
-		buckets: make([]requestsBucket, size),
-		size:    size,
-	}
-}
-
-// hit increments the counter for the bucket of the current minute.
-func (m *requestsMeter) hit(now time.Time) {
-	minute := now.Unix() - now.Unix()%60
-	idx := int((minute / 60) % int64(m.size))
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	b := &m.buckets[idx]
-	if b.Minute != minute {
-		// reset stale bucket from a previous lap
-		b.Minute = minute
-		b.Count = 0
-	}
-	b.Count++
-}
-
-// snapshot returns the last `hours` of minute-buckets in chronological order.
-// Buckets without traffic are returned with Count=0 to make charting trivial.
-func (m *requestsMeter) snapshot(now time.Time, hours int) []requestsBucket {
-	if hours <= 0 || hours*60 > m.size {
-		hours = m.size / 60
-	}
 	count := hours * 60
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	endMinute := now.Unix() - now.Unix()%60
+	startMinute := endMinute - int64((count-1)*60)
+
 	out := make([]requestsBucket, count)
 	for i := 0; i < count; i++ {
-		minute := endMinute - int64((count-1-i)*60)
-		idx := int((minute / 60) % int64(m.size))
-		b := m.buckets[idx]
-		if b.Minute != minute {
-			out[i] = requestsBucket{Minute: minute, Count: 0}
+		out[i] = requestsBucket{Minute: startMinute + int64(i*60), Count: 0}
+	}
+
+	if m.redis != nil {
+		from := time.Unix(startMinute, 0)
+		to := time.Unix(endMinute, 0)
+		if vals, err := m.redis.GetRequestRange(ctx, from, to); err == nil {
+			for i := range out {
+				if c, ok := vals[out[i].Minute]; ok {
+					out[i].Count = c
+				}
+			}
+			return out
 		} else {
-			out[i] = b
+			log.Printf("requests redis range: %v", err)
+		}
+	}
+
+	if m.tsdb != nil {
+		if buckets, err := m.tsdb.QueryRequests(ctx, time.Unix(startMinute, 0)); err == nil {
+			byMin := make(map[int64]int64, len(buckets))
+			for _, b := range buckets {
+				byMin[b.Minute.Unix()-b.Minute.Unix()%60] = b.Count
+			}
+			for i := range out {
+				if c, ok := byMin[out[i].Minute]; ok {
+					out[i].Count = c
+				}
+			}
 		}
 	}
 	return out
 }
 
-// requestsMiddleware bumps the meter for every request that flows through.
-func requestsMiddleware(m *requestsMeter) func(http.Handler) http.Handler {
+// flushLoop periodically copies completed minute buckets from Redis to TSDB
+// so request history is retained beyond Redis TTL / volume loss.
+func (m *RequestsMeter) FlushLoop(ctx context.Context) {
+	if m.redis == nil || m.tsdb == nil {
+		return
+	}
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			prev := time.Unix(now.Unix()-now.Unix()%60-60, 0)
+			c, err := m.redis.GetRequestCount(ctx, prev)
+			if err != nil {
+				log.Printf("requests flush get: %v", err)
+				continue
+			}
+			if c == 0 {
+				continue
+			}
+			if err := m.tsdb.UpsertRequestCount(ctx, prev, c); err != nil {
+				log.Printf("requests flush upsert: %v", err)
+			}
+		}
+	}
+}
+
+func requestsMiddleware(m *RequestsMeter) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			m.hit(time.Now())
+			m.hit(r.Context(), time.Now())
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-func handleRequests(m *requestsMeter) http.HandlerFunc {
+func handleRequests(m *RequestsMeter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hours, _ := strconv.Atoi(r.URL.Query().Get("hours"))
 		if hours <= 0 {
 			hours = 12
 		}
-		writeJSON(w, 200, m.snapshot(time.Now(), hours))
+		writeJSON(w, 200, m.snapshot(r.Context(), time.Now(), hours))
 	}
 }

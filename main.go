@@ -15,6 +15,8 @@ import (
 	"monitoring-api/internal/buffer"
 	"monitoring-api/internal/collector"
 	"monitoring-api/internal/docker"
+	"monitoring-api/internal/storage/rediscache"
+	"monitoring-api/internal/storage/tsdb"
 )
 
 func main() {
@@ -27,6 +29,16 @@ func main() {
 	points := parseInt(envOr("BUFFER_POINTS", "1800"))
 	allow := parseList(os.Getenv("CONTROL_ALLOWLIST"))
 	deny := parseList(os.Getenv("CONTROL_DENYLIST"))
+	corsOrigins := parseList(os.Getenv("CORS_ORIGINS"))
+
+	hostID := envOr("HOST_ID", "")
+	if hostID == "" {
+		if h, err := os.Hostname(); err == nil {
+			hostID = h
+		} else {
+			hostID = "default"
+		}
+	}
 
 	dc, err := docker.New()
 	if err != nil {
@@ -34,20 +46,72 @@ func main() {
 	}
 	defer dc.Close()
 
-	buf := buffer.New(points)
-	col := collector.New(dc, buf, interval)
-
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	tsdbStore, err := openTSDB(rootCtx, hostID)
+	if err != nil {
+		log.Printf("tsdb disabled: %v", err)
+	}
+	defer tsdbStore.Close()
+
+	redisStore, err := openRedis(rootCtx, hostID)
+	if err != nil {
+		log.Printf("redis disabled: %v", err)
+	}
+	defer redisStore.Close()
+
+	buf := buffer.New(points)
+
+	// Warm buffer from TSDB so /api/history is non-empty after restart.
+	if tsdbStore != nil {
+		since := time.Now().Add(-time.Duration(points) * interval)
+		if hist, err := tsdbStore.QueryRange(rootCtx, since); err == nil {
+			buf.Seed(hist)
+			log.Printf("warmed buffer with %d points from tsdb", len(hist))
+		} else {
+			log.Printf("tsdb warmup: %v", err)
+		}
+	}
+
+	// Async TSDB writer for live metrics.
+	if tsdbStore != nil {
+		writes := make(chan buffer.Point, 256)
+		buf.SetOnPush(func(p buffer.Point) {
+			select {
+			case writes <- p:
+			default:
+				// drop on backpressure rather than blocking the collector
+			}
+		})
+		go func() {
+			for p := range writes {
+				wctx, c := context.WithTimeout(rootCtx, 3*time.Second)
+				if err := tsdbStore.WriteSnapshot(wctx, p); err != nil {
+					log.Printf("tsdb write: %v", err)
+				}
+				c()
+			}
+		}()
+	}
+
+	col := collector.New(dc, buf, interval)
 	go col.Run(rootCtx)
+
+	meter := api.NewRequestsMeter(redisStore, tsdbStore)
+	go meter.FlushLoop(rootCtx)
 
 	handler := api.NewRouter(api.Config{
 		Token:            token,
 		Buffer:           buf,
 		Docker:           dc,
 		Collector:        col,
+		TSDB:             tsdbStore,
+		Redis:            redisStore,
 		ControlAllowlist: allow,
 		ControlDenylist:  deny,
+		CORSOrigins:      corsOrigins,
+		Meter:            meter,
 	})
 
 	srv := &http.Server{
@@ -57,7 +121,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("monitoring-api listening on %s (interval=%s, buffer=%d)", addr, interval, points)
+		log.Printf("monitoring-api listening on %s (interval=%s, buffer=%d, host_id=%s)", addr, interval, points, hostID)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}
@@ -70,6 +134,26 @@ func main() {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelShutdown()
 	_ = srv.Shutdown(shutdownCtx)
+}
+
+func openTSDB(ctx context.Context, hostID string) (*tsdb.Store, error) {
+	dsn := os.Getenv("TSDB_DSN")
+	if dsn == "" {
+		return nil, nil
+	}
+	octx, c := context.WithTimeout(ctx, 10*time.Second)
+	defer c()
+	return tsdb.Open(octx, dsn, hostID)
+}
+
+func openRedis(ctx context.Context, hostID string) (*rediscache.Store, error) {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		return nil, nil
+	}
+	octx, c := context.WithTimeout(ctx, 5*time.Second)
+	defer c()
+	return rediscache.Open(octx, addr, hostID)
 }
 
 func envOr(k, def string) string {
