@@ -30,17 +30,22 @@ func NewRouter(cfg Config) http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.Timeout(20 * time.Second))
 
+	meter := newRequestsMeter(12)
+
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 
 	r.Route("/api", func(r chi.Router) {
 		r.Use(authMiddleware(cfg.Token))
+		r.Use(requestsMiddleware(meter))
 		r.Get("/snapshot", handleSnapshot(cfg))
 		r.Get("/history", handleHistory(cfg))
 		r.Get("/containers", handleContainers(cfg))
 		r.Get("/containers/{id}/logs", handleLogs(cfg))
 		r.Post("/containers/{id}/action", handleAction(cfg))
+		r.Get("/requests", handleRequests(meter))
+		r.Get("/hosts", handleHosts())
 	})
 
 	return r

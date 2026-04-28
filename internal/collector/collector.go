@@ -199,7 +199,7 @@ func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
 		// so a disk with multiple partitions (e.g. sda1=/boot/efi, sda2=/) is shown once.
 		perDevice := map[string]DiskInfo{}
 		for _, p := range parts {
-			if seen[p.Mountpoint] || !isRealFS(p.Fstype) {
+			if seen[p.Mountpoint] || !isRealFS(p.Fstype) || strings.HasPrefix(p.Mountpoint, "/boot") {
 				continue
 			}
 			if len(diskFilter) > 0 && !diskMatchesFilter(p.Device, diskFilter) {
