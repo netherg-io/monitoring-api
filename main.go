@@ -62,6 +62,7 @@ func main() {
 	defer redisStore.Close()
 
 	buf := buffer.New(points)
+	cbuf := buffer.NewContainer(points)
 
 	// Warm buffer from TSDB so /api/history is non-empty after restart.
 	if tsdbStore != nil {
@@ -95,7 +96,7 @@ func main() {
 		}()
 	}
 
-	col := collector.New(dc, buf, interval)
+	col := collector.New(dc, buf, cbuf, interval)
 	go col.Run(rootCtx)
 
 	meter := api.NewRequestsMeter(redisStore, tsdbStore)
@@ -104,6 +105,7 @@ func main() {
 	handler := api.NewRouter(api.Config{
 		Token:            token,
 		Buffer:           buf,
+		ContainerBuffer:  cbuf,
 		Docker:           dc,
 		Collector:        col,
 		TSDB:             tsdbStore,

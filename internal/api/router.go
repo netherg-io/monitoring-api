@@ -20,6 +20,7 @@ import (
 type Config struct {
 	Token            string
 	Buffer           *buffer.Buffer
+	ContainerBuffer  *buffer.ContainerBuffer
 	Docker           *docker.Client
 	Collector        *collector.Collector
 	TSDB             *tsdb.Store
@@ -52,6 +53,7 @@ func NewRouter(cfg Config) http.Handler {
 		r.Get("/snapshot", handleSnapshot(cfg))
 		r.Get("/history", handleHistory(cfg))
 		r.Get("/containers", handleContainers(cfg))
+		r.Get("/containers/{id}/history", handleContainerHistory(cfg))
 		r.Get("/containers/{id}/logs", handleLogs(cfg))
 		r.Post("/containers/{id}/action", handleAction(cfg))
 		r.Get("/requests", handleRequests(meter))
@@ -118,6 +120,25 @@ func handleContainers(cfg Config) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, 200, list)
+	}
+}
+
+func handleContainerHistory(cfg Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		minutes, _ := strconv.Atoi(r.URL.Query().Get("minutes"))
+		if minutes <= 0 {
+			minutes = 15
+		}
+		since := time.Now().Add(-time.Duration(minutes) * time.Minute)
+		var points []buffer.ContainerPoint
+		if cfg.ContainerBuffer != nil {
+			points = cfg.ContainerBuffer.Since(id, since)
+		}
+		if points == nil {
+			points = []buffer.ContainerPoint{}
+		}
+		writeJSON(w, 200, points)
 	}
 }
 

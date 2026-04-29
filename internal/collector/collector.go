@@ -28,6 +28,7 @@ type containerNetEntry struct {
 type Collector struct {
 	d        *docker.Client
 	b        *buffer.Buffer
+	cb       *buffer.ContainerBuffer
 	interval time.Duration
 
 	mu               sync.RWMutex
@@ -80,10 +81,11 @@ type ContainerRow struct {
 	Stat *docker.Stat `json:"stat,omitempty"`
 }
 
-func New(d *docker.Client, b *buffer.Buffer, interval time.Duration) *Collector {
+func New(d *docker.Client, b *buffer.Buffer, cb *buffer.ContainerBuffer, interval time.Duration) *Collector {
 	return &Collector{
 		d:                d,
 		b:                b,
+		cb:               cb,
 		interval:         interval,
 		lastContainerNet: make(map[string]containerNetEntry),
 	}
@@ -137,6 +139,25 @@ func (c *Collector) store(s Snapshot) {
 		Load5:      s.Load[1],
 		Load15:     s.Load[2],
 	})
+	if c.cb != nil {
+		active := make(map[string]bool, len(s.Containers))
+		for _, row := range s.Containers {
+			active[row.ID] = true
+			if row.Stat == nil {
+				continue
+			}
+			c.cb.Push(row.ID, buffer.ContainerPoint{
+				TS:         s.TS,
+				CPU:        row.Stat.CPUPercent,
+				MemPercent: row.Stat.MemPercent,
+				MemUsed:    row.Stat.MemUsed,
+				MemLimit:   row.Stat.MemLimit,
+				NetRxBps:   row.Stat.NetRxBps,
+				NetTxBps:   row.Stat.NetTxBps,
+			})
+		}
+		c.cb.Prune(active)
+	}
 }
 
 func (c *Collector) collect(ctx context.Context) (Snapshot, error) {
