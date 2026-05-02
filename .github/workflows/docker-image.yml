@@ -34,7 +34,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/netherguy4/monitoring-api
+          images: ghcr.io/netherg-io/monitoring-api
           tags: |
             type=raw,value=latest
             type=sha,format=long
