@@ -1,0 +1,21 @@
+name: Bug report
+description: Report a LiveDock API issue
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is broken?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or errors
+      description: Include relevant output or API responses.
+  - type: textarea
+    id: context
+    attributes:
+      label: Environment
+      description: OS, Docker version, deployment target, and env vars that matter.

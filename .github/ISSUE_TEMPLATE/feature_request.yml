@@ -1,0 +1,23 @@
+name: Feature request
+description: Suggest an improvement for LiveDock API
+labels: [enhancement]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What would you like to add or change?
+    validations:
+      required: true
+  - type: textarea
+    id: reason
+    attributes:
+      label: Why it matters
+      description: What problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Include desired routes, payloads, or behavior.
